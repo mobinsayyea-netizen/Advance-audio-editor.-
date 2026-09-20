@@ -197,6 +197,7 @@
   input[type=file]{display:none;}
   ::-webkit-scrollbar{display:none;}
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.0/lame.min.js"></script>
 </head>
 <body>
 
@@ -343,6 +344,16 @@
   let attachedFiles = [];     // {id, kind:'audio'|'image', name, buffer, dataURL}
   let attachCounter = 0;
 
+  // Technical facts about the currently loaded main file — kept so the AI
+  // always has real duration/format/size to answer questions with, instead
+  // of guessing or saying "I don't know" (project-context awareness).
+  let mainFileMeta = null;    // {name, sizeBytes, mimeType}
+  function fmtBytes(n){
+    if(n==null || !isFinite(n)) return 'unknown size';
+    if(n < 1024*1024) return (n/1024).toFixed(0)+' KB';
+    return (n/(1024*1024)).toFixed(2)+' MB';
+  }
+
   let commandLog = [];        // {time, text, result}
 
   let processing = false;
@@ -389,7 +400,42 @@
   // Actions that are harmless/reversible enough to run immediately, without
   // an extra "Yes, do it" confirmation tap — important for TalkBack users,
   // who would otherwise have to swipe an extra confirm step for every command.
-  const SAFE_ACTION_TYPES = new Set(['play','undo','redo','mark-start','mark-end','ask','play-attachment','play-original','note']);
+  const SAFE_ACTION_TYPES = new Set(['play','undo','redo','mark-start','mark-end','ask','play-attachment','play-original','note','info-answer','read-transcript','stop-transcript','transcript-next','transcript-prev','generate-transcript']);
+
+  // ========================================================================
+  // TRANSCRIPT (speech-to-text + notable events, via Gemini) — Stage 1
+  // ========================================================================
+  // transcript: {language:'hi'|'en'|'mr'|..., segments:[{start,end,text}], events:[{time,description}]}
+  let transcript = null;
+  let transcriptState = 'none'; // 'none' | 'loading' | 'ready' | 'error'
+  let transcriptGeneration = 0; // bumped on every invalidation so a stale in-flight response is ignored
+  let mainFileBlob = null;      // raw uploaded Blob/File for the current main AUDIO track (for sending to Gemini)
+  // BCP-47 codes for common languages this app expects, so TTS uses the
+  // phone/TalkBack's own configured voice for that language rather than
+  // the app forcing a fixed voice.
+  const LANG_BCP47 = {hi:'hi-IN', mr:'mr-IN', en:'en-IN', gu:'gu-IN', ta:'ta-IN', te:'te-IN', kn:'kn-IN', bn:'bn-IN', pa:'pa-IN', ur:'ur-IN'};
+  function bcp47For(langCode){ return LANG_BCP47[(langCode||'').toLowerCase()] || 'hi-IN'; }
+  function detectSpokenLangGuess(text){
+    // Rough fallback only used when we have no transcript-detected language yet:
+    // Devanagari script → Hindi/Marathi bucket (hi-IN covers both reasonably).
+    return /[\u0900-\u097F]/.test(text||'') ? 'hi' : 'en';
+  }
+  // Transcript navigation/reading mode — reuses the existing Play/Rewind/
+  // Forward buttons instead of adding new controls (per spec).
+  let transcriptMode = false;
+  // ---- Proactive feature-discovery suggestions (basic users often only ever
+  // use the 2-3 things they already know, e.g. mix/merge — this nudges them
+  // toward other real controls, in the background, without slowing Play down) ----
+  let editsSinceLastSuggestion = 0;
+  let suggestionsGivenThisSession = 0;
+  const EDITS_PER_SUGGESTION = 3;      // don't suggest after every tiny tweak
+  const MAX_SUGGESTIONS_PER_SESSION = 3; // keep Gemini-quota impact small
+  // Real content-changing action types only — asking/querying/playing/marking
+  // shouldn't count toward "the user has made progress worth commenting on".
+  const EDIT_COUNTING_TYPES = new Set(['effect','set-control','mix','merge','cue-sheet','range-delete',
+    'range-keep','silence-multi','volume','reset-effects','remove-effect','sfx','video','mute','adjustLast']);
+  let transcriptIdx = 0;        // which segment is current in transcript mode
+  let transcriptSpeaking = false;
 
   // ------------------------------------------------------------------------
   // VIDEO MODE STATE (native browser recording — no heavy external library)
@@ -419,6 +465,10 @@
   const playhead = $('playhead');
   const curTimeEl = $('curTime'), totalTimeEl = $('totalTime');
   const playBtn = $('playBtn');
+  // Keeps visible text AND the screen-reader label in sync — TalkBack users
+  // rely on aria-label, sighted users rely on the visible text; both must
+  // always agree on whether the button currently means "Play" or "Pause".
+  function setPlayBtnLabel(text){ playBtn.textContent = text; playBtn.setAttribute('aria-label', text); }
   const editBoxBtn = $('editBoxBtn');
   const editSheet = $('editSheet');
   const overlay = $('overlay');
@@ -449,12 +499,15 @@
   // ========================================================================
   // STATUS + ACCESSIBILITY (screen reader live region + spoken updates)
   // ========================================================================
-  function speak(text){
+  function speak(text, langCode){
     try{
       if(!('speechSynthesis' in window)) return;
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text.replace(/[✅❌⚠️⏳💾🎚️🔊📍✂️🗑️📋↩️🎵🖼️📎🔁📜⏸]/g,''));
-      u.lang = 'hi-IN';
+      // Only the LANGUAGE is set here — never a specific voice name. This
+      // lets the phone/TalkBack's own configured TTS engine+voice for that
+      // language do the actual speaking, instead of the app forcing one.
+      u.lang = bcp47For(langCode || detectSpokenLangGuess(text));
       u.rate = 1.05;
       window.speechSynthesis.speak(u);
     }catch(e){ /* speech not supported — silently ignore */ }
@@ -462,7 +515,7 @@
   function setStatus(msg, isErr, opts){
     statusLine.textContent = msg;
     statusLine.classList.toggle('err', !!isErr);
-    if(!opts || opts.speak !== false) speak(msg);
+    if(!opts || opts.speak !== false) speak(msg, opts && opts.lang);
   }
   function fmtTime(s){
     if(!isFinite(s) || s<0) s=0;
@@ -472,13 +525,47 @@
   }
 
   // ========================================================================
-  // COMMAND LOG — kept internally (not shown as a History panel) so recent
-  // commands can be sent to Gemini as short-term memory/context.
+  // COMMAND LOG — kept internally (not shown as a History panel) so the
+  // FULL edit history of this session can be sent to Gemini as context
+  // (project-context awareness: the AI should always know everything that
+  // has been done, not just the last few steps).
   // ========================================================================
   function logCommand(text, result){
     const item = {time: Date.now(), text, result};
     commandLog.push(item);
-    if(commandLog.length>30) commandLog.shift();
+    // Effectively unbounded for a normal editing session — only guards
+    // against runaway memory in an extreme multi-hour session.
+    if(commandLog.length>2000) commandLog.shift();
+  }
+  // Gemini is told to return strict JSON, but its text output sometimes
+  // contains a real, literal newline/tab character INSIDE a string value
+  // (e.g. a multi-line numbered explanation, or a multi-line lyric) instead
+  // of an escaped "\n" — raw control characters inside a JSON string are
+  // illegal and make JSON.parse throw exactly this kind of error: "Expected
+  // ',' or '}' after property value in JSON at position N". This walks the
+  // text once, tracking whether we're currently inside a quoted string
+  // (respecting \" escapes), and only escapes control characters that are
+  // actually inside a string — everything else in the JSON is left untouched.
+  function sanitizeJsonText(txt){
+    let out = '';
+    let inString = false;
+    let escaped = false;
+    for(let i=0;i<txt.length;i++){
+      const ch = txt[i];
+      if(inString){
+        if(escaped){ out += ch; escaped = false; continue; }
+        if(ch==='\\'){ out += ch; escaped = true; continue; }
+        if(ch==='"'){ inString = false; out += ch; continue; }
+        if(ch==='\n'){ out += '\\n'; continue; }
+        if(ch==='\r'){ out += '\\r'; continue; }
+        if(ch==='\t'){ out += '\\t'; continue; }
+        out += ch;
+      } else {
+        if(ch==='"'){ inString = true; }
+        out += ch;
+      }
+    }
+    return out;
   }
   function escapeHtml(s){
     const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
@@ -504,10 +591,13 @@
       const decoded = await audioCtx.decodeAudioData(arr);
       buffer = decoded;
       originalBuffer = cloneBuffer(decoded);
+      mainFileMeta = {name:f.name, sizeBytes:f.size, mimeType:f.type || 'audio (unknown exact format)'};
+      mainFileBlob = f;
       historyActions = []; redoActions = []; resetEffectStack();
       attachedFiles = []; attachCounter = 0; renderAttachList(); updateAttachBtnLabel();
       commandLog = [];
       markStart = null; markEnd = null; lastAdjustable = null; adjustableLevels = {}; lastMix = null; userNotes = [];
+      exitTranscriptMode(false);
       switchPreviewUI('audio');
       uploadCard.classList.add('hidden');
       editorArea.classList.remove('hidden');
@@ -516,6 +606,9 @@
       drawWave();
       updateTimeUI();
       setStatus("Ready for audio editing");
+      // NOTE: transcript is NOT generated automatically here — it costs a
+      // Gemini call/quota, so it only runs when the user explicitly asks
+      // for it (e.g. "iska transcript bana do") — see generate-transcript.
     }catch(err){
       setStatus("File could not load: " + err.message, true);
     }
@@ -544,10 +637,12 @@
       mediaMode = 'video';
       videoFile = f;
       originalVideoFile = f;
+      mainFileMeta = {name:f.name, sizeBytes:f.size, mimeType:f.type || 'video (unknown exact format)'};
       videoHistory = []; videoRedoStack = [];
       attachedFiles = []; attachCounter = 0; renderAttachList(); updateAttachBtnLabel();
       commandLog = [];
       markStart = null; markEnd = null; lastAdjustable = null; adjustableLevels = {}; lastMix = null; userNotes = [];
+      exitTranscriptMode(false);
       switchPreviewUI('video');
       const url = URL.createObjectURL(f);
       videoEl.src = url;
@@ -559,6 +654,7 @@
         bottomBar.classList.remove('hidden');
         updateTimeUI();
         setStatus("Ready for video editing");
+        // NOTE: transcript is NOT generated automatically — only on explicit request.
         resolve(true);
       };
       videoEl.onerror = ()=>{
@@ -585,9 +681,16 @@
   attachInput.addEventListener('change', async (e)=>{
     const files = Array.from(e.target.files || []);
     attachInput.value = '';
+    const uploaded = [];
+    const failed = [];
     for(const f of files){
       attachCounter++;
       const num = attachCounter;
+      // Multi-file hang fix: per-file status updates must NOT speak (TTS).
+      // Firing speechSynthesis.cancel()+speak() once per file, back-to-back,
+      // was the actual freeze cause on low-RAM phones — not the decoding.
+      // We now update the text status silently per file and speak a single
+      // combined summary once, after the whole batch finishes.
       setStatus("Uploading file "+num+"...", false, {speak:false});
       try{
         if(f.type.startsWith('image/')){
@@ -603,17 +706,25 @@
           attachedFiles.push({id:num, kind:'audio', name:f.name, buffer:decoded});
         }
         renderAttachList();
-        setStatus("File "+num+" uploaded: "+f.name);
+        setStatus("File "+num+" uploaded: "+f.name, false, {speak:false});
         logCommand('[attach] '+f.name, 'added as File '+num);
+        uploaded.push(num);
       }catch(err){
-        setStatus("File "+num+" could not upload: "+err.message, true);
+        setStatus("File "+num+" could not upload: "+err.message, true, {speak:false});
+        failed.push(num);
       }
-      // Give the browser/screen-reader a breath between files — without this,
-      // selecting many files at once (even small ones) can decode/announce
-      // them back-to-back fast enough to freeze the tab on a low-RAM phone.
-      await new Promise(resolve => setTimeout(resolve, 0));
+      // Give the browser a real breath between files so the UI/decoder isn't
+      // hammered back-to-back on a low-RAM phone (0ms was not enough).
+      await new Promise(resolve => setTimeout(resolve, 30));
     }
     updateAttachBtnLabel();
+    // One combined spoken/visible summary for the whole batch, instead of
+    // speaking on every file — this is the actual multi-file hang fix.
+    if(uploaded.length || failed.length){
+      let summary = uploaded.length ? (uploaded.length===1 ? "File uploaded." : uploaded.length+" files uploaded.") : "";
+      if(failed.length) summary += (summary?" ":"")+failed.length+" file(s) could not upload.";
+      setStatus(summary, failed.length>0 && !uploaded.length, {speak:true});
+    }
   });
   function fileToDataURL(f){
     return new Promise((res, rej)=>{
@@ -714,7 +825,7 @@
     }
     isPlaying = false;
     playingComparison = false;
-    playBtn.textContent = "Play";
+    setPlayBtnLabel("Play");
     if(rafId) cancelAnimationFrame(rafId);
   }
 
@@ -731,31 +842,70 @@
     sourceNode.start(0, playStartOffset);
     isPlaying = true;
     playingComparison = (buf !== buffer);
-    playBtn.textContent = "Pause";
+    setPlayBtnLabel("Pause");
     sourceNode.onended = ()=>{
       if(isPlaying){
-        isPlaying=false; playingComparison=false; playBtn.textContent="Play";
+        // Natural end-of-audio: snap playheadPos to the very end so the next
+        // Play click is correctly detected as "restart from 0" (bug fix).
+        const wasComparison = playingComparison;
+        isPlaying=false; playingComparison=false; setPlayBtnLabel("Play");
+        if(!wasComparison){ playheadPos = buf.duration; updateTimeUI(); maybeOfferFeatureSuggestion(); }
+        if(rafId) cancelAnimationFrame(rafId);
       }
     };
     tick(buf);
+  }
+
+  // Fires at most a few times per session, only after the user has actually
+  // made some real progress (EDITS_PER_SUGGESTION edits) and only once they've
+  // played the result through to the end — never mid-edit, never on a bare
+  // "play" with nothing changed yet. Runs fully in the background: Play itself
+  // already finished, so this can never add latency to playback.
+  async function maybeOfferFeatureSuggestion(){
+    const apiKey = apiKeyInput.value.trim();
+    if(!apiKey) return; // no key = no extra Gemini calls at all
+    if(editsSinceLastSuggestion < EDITS_PER_SUGGESTION) return;
+    if(suggestionsGivenThisSession >= MAX_SUGGESTIONS_PER_SESSION) return;
+    editsSinceLastSuggestion = 0;
+    suggestionsGivenThisSession++;
+    try{
+      const fullHistoryLog = commandLog.map(i=>'"'+i.text+'" -> '+i.result).join(' | ');
+      const sys = `The user is editing audio in a prompt-driven editor and just finished listening to their result. Here is everything done so far this session: ${fullHistoryLog}. Suggest exactly ONE real feature/effect from this editor's full toolkit (EQ, bass/treble, echo, reverb, chorus/tremolo/vibrato, compressor, phaser, limiter, noise reduction, high/low-pass filter, normalize, reverse) that they have NOT tried yet and that plausibly fits what they're making, in one short warm sentence in the same language/style as their own commands, ending by asking if they'd like it applied. Do not use any effect they've already used. Do not mention JSON, actions, or that you are an AI model — just the friendly suggestion itself as plain text, nothing else. If genuinely nothing new seems useful, reply with exactly: NONE`;
+      const resp = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key="+encodeURIComponent(apiKey), {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        // Pure text suggestion, zero reasoning needed — thinking OFF so this
+        // background nice-to-have never burns real quota/time.
+        body: JSON.stringify({contents:[{parts:[{text:sys}]}], generationConfig:{thinkingConfig:{thinkingBudget:0}}})
+      });
+      if(!resp.ok) return; // quietly skip — this is a nice-to-have, never worth surfacing an error for
+      const data = await resp.json();
+      const text = (data.candidates && data.candidates[0] && data.candidates[0].content.parts[0].text || '').trim();
+      if(!text || text==='NONE') return;
+      // Only speak/show it if the user hasn't already started doing something
+      // else in the meantime (don't talk over a fresh command they just gave).
+      if(!isPlaying && !processing && !transcriptMode) setStatus(text, false, {speak:true});
+    }catch(e){ /* silent — a missed suggestion is not worth bothering the user about */ }
   }
 
   function tick(buf){
     if(!isPlaying){ return; }
     const elapsed = audioCtx.currentTime - playStartTime;
     const pos = playStartOffset + elapsed;
-    if(!playingComparison) { playheadPos = pos; updateTimeUI(); }
+    const isComparison = playingComparison;
+    if(!isComparison) { playheadPos = pos; updateTimeUI(); }
     if(pos >= buf.duration){
       isPlaying = false;
       playingComparison = false;
-      playBtn.textContent = "Play";
-      if(!playingComparison) updateTimeUI();
+      setPlayBtnLabel("Play");
+      if(!isComparison){ playheadPos = buf.duration; updateTimeUI(); }
+      if(rafId) cancelAnimationFrame(rafId);
       return;
     }
     rafId = requestAnimationFrame(()=>tick(buf));
   }
 
   playBtn.addEventListener('click', ()=>{
+    if(transcriptMode){ transcriptPlayPauseToggle(); return; }
     if(mediaMode==='video'){
       if(!videoFile) return;
       if(videoIsPlaying) videoPause(); else videoPlay();
@@ -773,6 +923,7 @@
   });
 
   $('rewindBtn').addEventListener('click', ()=>{
+    if(transcriptMode){ transcriptStep(-1); return; }
     if(mediaMode==='video'){
       if(!videoFile) return;
       videoSeekTo(Math.max(0, videoEl.currentTime - 10));
@@ -789,6 +940,7 @@
     if(wasPlaying) playFrom(playheadPos); else stopPlayback();
   });
   $('forwardBtn').addEventListener('click', ()=>{
+    if(transcriptMode){ transcriptStep(1); return; }
     if(mediaMode==='video'){
       if(!videoFile) return;
       videoSeekTo(Math.min(videoDuration, videoEl.currentTime + 10));
@@ -827,13 +979,13 @@
   function videoPlay(){
     videoEl.play();
     videoIsPlaying = true;
-    playBtn.textContent = "Pause";
+    setPlayBtnLabel("Pause");
     videoTick();
   }
   function videoPause(){
     videoEl.pause();
     videoIsPlaying = false;
-    playBtn.textContent = "Play";
+    setPlayBtnLabel("Play");
     if(videoRafId) cancelAnimationFrame(videoRafId);
   }
   function videoSeekTo(t){
@@ -847,19 +999,21 @@
     updateTimeUI();
     if(videoEl.ended || videoEl.paused){
       videoIsPlaying = false;
-      playBtn.textContent = "Play";
+      setPlayBtnLabel("Play");
       return;
     }
     videoRafId = requestAnimationFrame(videoTick);
   }
   videoEl.addEventListener('ended', ()=>{
     videoIsPlaying = false;
-    playBtn.textContent = "Play";
+    setPlayBtnLabel("Play");
     if(videoComparing){
       videoComparing = false;
       videoEl.src = URL.createObjectURL(videoFile);
       videoEl.onloadedmetadata = ()=>{ videoDuration = videoEl.duration; videoPlayheadPos=0; updateTimeUI(); };
       setStatus("Back on the current (edited) version now", false, {speak:false});
+    } else {
+      maybeOfferFeatureSuggestion();
     }
   });
 
@@ -914,10 +1068,11 @@
     }
     return out;
   }
-  function concatBuffers(buf1, buf2){
+  function concatBuffers(buf1, buf2, vol2){
     if(!buf1 && !buf2) return null;
     if(!buf1) return buf2;
     if(!buf2) return buf1;
+    const gain2 = vol2==null ? 1 : vol2; // lets "merge" set the attached file's own loudness, default unchanged
     const sr = buf1.sampleRate;
     const ch = Math.max(buf1.numberOfChannels, buf2.numberOfChannels);
     const len = buf1.length + buf2.length;
@@ -927,7 +1082,8 @@
       const d1 = buf1.getChannelData(Math.min(c,buf1.numberOfChannels-1));
       const d2 = buf2.getChannelData(Math.min(c,buf2.numberOfChannels-1));
       outData.set(d1,0);
-      outData.set(d2,buf1.length);
+      if(gain2===1) outData.set(d2,buf1.length);
+      else for(let i=0;i<d2.length;i++) outData[buf1.length+i] = d2[i]*gain2;
     }
     return out;
   }
@@ -969,6 +1125,7 @@
     drawWave();
     updateTimeUI();
     setStatus(label||'Done');
+    invalidateTranscript(); // timing changed — old transcript timestamps no longer match
   }
   // Records one lightweight action descriptor (see historyActions comment
   // above) and applies its already-computed result. `desc` must be a plain
@@ -997,7 +1154,7 @@
       case 'merge': {
         const af = getAttached(action.fileId, 'audio');
         if(!af) return buf;
-        return concatBuffers(buf, af.buffer);
+        return concatBuffers(buf, af.buffer, action.volume);
       }
       case 'cuesheet': {
         let bg = audioCtx.createBuffer(buf.numberOfChannels, buf.length, buf.sampleRate);
@@ -1090,6 +1247,38 @@
     }
     return out;
   }
+  // Raw WAV is uncompressed PCM — a 9-minute stereo file at 44.1kHz comes out
+  // to ~90-100MB, which is exactly the "9 minute audio became 111MB" report.
+  // MP3 at 128kbps gives near-transparent quality for spoken/mixed content at
+  // roughly 1/10th the size. Falls back to WAV automatically if the encoder
+  // library didn't load (e.g. no internet at the moment of download).
+  function bufferToMp3(buf, kbps){
+    if(typeof lamejs==='undefined') return null;
+    const numCh = Math.min(buf.numberOfChannels, 2); // lamejs only supports mono/stereo
+    const sr = buf.sampleRate;
+    const encoder = new lamejs.Mp3Encoder(numCh, sr, kbps||128);
+    const chData = [];
+    for(let c=0;c<numCh;c++) chData.push(buf.getChannelData(c));
+    const toInt16 = (f32)=>{
+      const out = new Int16Array(f32.length);
+      for(let i=0;i<f32.length;i++){ const s = Math.max(-1, Math.min(1, f32[i])); out[i] = s<0 ? s*0x8000 : s*0x7FFF; }
+      return out;
+    };
+    const left = toInt16(chData[0]);
+    const right = numCh>1 ? toInt16(chData[1]) : null;
+    const chunkSize = 1152; // lamejs's required per-call block size
+    const mp3Data = [];
+    for(let i=0;i<left.length;i+=chunkSize){
+      const lChunk = left.subarray(i, i+chunkSize);
+      const mp3buf = right
+        ? encoder.encodeBuffer(lChunk, right.subarray(i, i+chunkSize))
+        : encoder.encodeBuffer(lChunk);
+      if(mp3buf.length>0) mp3Data.push(mp3buf);
+    }
+    const end = encoder.flush();
+    if(end.length>0) mp3Data.push(end);
+    return new Blob(mp3Data, {type:'audio/mp3'});
+  }
   function downloadBlob(blob, filename){
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1108,9 +1297,16 @@
     if(!buffer) return;
     setStatus("Preparing the file...");
     setTimeout(()=>{
-      const wav = bufferToWav(buffer);
-      downloadBlob(new Blob([wav], {type:'audio/wav'}), 'edited-audio-'+Date.now()+'.wav');
-      setStatus("Downloaded");
+      const mp3Blob = bufferToMp3(buffer, 128);
+      if(mp3Blob){
+        downloadBlob(mp3Blob, 'edited-audio-'+Date.now()+'.mp3');
+        setStatus("Downloaded (MP3, much smaller than WAV)");
+      } else {
+        // lamejs didn't load (e.g. offline right now) — WAV still works, just larger.
+        const wav = bufferToWav(buffer);
+        downloadBlob(new Blob([wav], {type:'audio/wav'}), 'edited-audio-'+Date.now()+'.wav');
+        setStatus("Downloaded as WAV (MP3 encoder unavailable right now — file will be larger)");
+      }
     }, 30);
   });
 
@@ -1182,6 +1378,7 @@
         videoPlayheadPos = Math.min(videoPlayheadPos, videoDuration);
         updateTimeUI();
         setStatus(label||'Done');
+        invalidateTranscript(); // timing changed — old transcript/events no longer match
         res();
       };
     });
@@ -2222,6 +2419,26 @@
     return actions;
   }
 
+  // Human-friendly names for the real advanced-panel control keys, used only
+  // for confirm-dialog / history text — the keys themselves (e.g. "reverbMix")
+  // stay as-is everywhere else in the code.
+  const ADV_KEY_LABELS = {
+    bass:'Bass', treble:'Treble',
+    echoIn:'Echo In Gain', echoOut:'Echo Out Gain', echoDelay:'Echo Delay', echoDecay:'Echo Decay',
+    reverbMix:'Reverb Mix', reverbWidth:'Reverb Width', reverbDamp:'Reverb Damp', reverbRoom:'Reverb Room Size',
+    chorus:'Chorus', crystalizer:'Crystalizer', tremoloFreq:'Tremolo Frequency', tremoloDepth:'Tremolo Depth',
+    vibratoFreq:'Vibrato Frequency', vibratoDepth:'Vibrato Depth', threeD:'3D Rotation',
+    compressorThreshold:'Compressor Threshold', compressorRatio:'Compressor Ratio',
+    compressorAttack:'Compressor Attack', compressorRelease:'Compressor Release',
+    phaserIn:'Phaser In Gain', phaserOut:'Phaser Out Gain', phaserDelay:'Phaser Delay', phaserDecay:'Phaser Decay',
+    limiterIn:'Limiter Level In', limiterOut:'Limiter Level Out', limiterAttack:'Limiter Attack', limiterRelease:'Limiter Release',
+    noiseReduction:'Noise Reduction', highpass:'High-pass Filter', lowpass:'Low-pass Filter',
+    volume:'Volume', speed:'Tempo/Speed', pitch:'Pitch'
+  };
+  function advKeyLabel(k){
+    if(k.startsWith('eq.')) return 'EQ '+k.slice(3)+' Hz';
+    return ADV_KEY_LABELS[k] || k;
+  }
   function describeAction(action){
     switch(action.type){
       case 'undo': return "Undo the last change";
@@ -2240,7 +2457,10 @@
       case 'mix': return "Mix File "+action.fileId+" from "+fmtTime(action.start)+" to "+fmtTime(action.end)+" (volume "+Math.round((action.volume==null?1:action.volume)*100)+"%)";
       case 'cue-sheet': return "Build a background layer from "+(action.items?action.items.length:0)+" music cue(s) and add it";
       case 'ask': return "Ask for clarification: "+action.question;
-      case 'merge': return "Merge in File "+action.fileId;
+      case 'merge': return "Merge in File "+action.fileId+" (volume "+Math.round((action.volume==null?1:action.volume)*100)+"%)";
+      case 'set-control': return advKeyLabel(String(action.key))+": "+advDisplayValue(String(action.key), Number(action.value));
+      case 'query-control': return "Check "+advKeyLabel(String(action.key));
+      case 'apply-advanced': return "Apply the control changes above";
       case 'volume': return "Set volume to "+Math.round(action.value*100)+"%";
       case 'video': return "Make a video from an image";
       case 'mute': return "Mute the video";
@@ -2249,6 +2469,12 @@
       case 'reset-effects': return "Remove every effect and restore the original, unedited audio/video";
       case 'remove-effect': return "Remove the "+(KIND_LABELS[action.kind]||action.kind)+" effect completely, keeping any other effects";
       case 'query-level': return "Tell you the current level of "+(action.kind||'the last effect');
+      case 'info-answer': return "Answer your question";
+      case 'read-transcript': return "Read the transcript aloud";
+      case 'stop-transcript': return "Stop reading the transcript";
+      case 'transcript-next': return "Next transcript line";
+      case 'transcript-prev': return "Previous transcript line";
+      case 'generate-transcript': return "Prepare a transcript of this audio/video";
       default: return null;
     }
   }
@@ -2257,6 +2483,14 @@
   // ACTION EXECUTION (each returns a short result string for logging)
   // ========================================================================
   async function executeAction(action){
+    if(action.type==='generate-transcript'){ scheduleTranscriptRefresh(null, true); return "Transcript ban raha hai"; }
+    if(action.type==='read-transcript'){ enterTranscriptMode(); return "Reading transcript"; }
+    if(action.type==='stop-transcript'){ exitTranscriptMode(true); return "Stopped reading transcript"; }
+    if(action.type==='transcript-next'){ if(transcriptMode) transcriptStep(1); return "Next line"; }
+    if(action.type==='transcript-prev'){ if(transcriptMode) transcriptStep(-1); return "Previous line"; }
+    if(transcriptMode && (action.type==='play'||action.type==='play-original'||action.type==='play-attachment')){
+      exitTranscriptMode(true);
+    }
     if(action.type==='mark-start'){
       markStart = getCurrentPos();
       return "Marked position "+fmtTime(markStart)+" — now give any instruction (trim, mix, merge, silence...) and it will use this as the starting point automatically.";
@@ -2282,6 +2516,13 @@
     }
     if(action.type==='play-original'){
       return await playOriginal();
+    }
+    if(action.type==='info-answer'){
+      // Directly answer questions about the project (duration, format, size,
+      // edit history, attached files, control values) using the context the
+      // model was already given — never a guess, and never "I don't know".
+      setStatus(action.answer, false, {speak:true});
+      return "Answered";
     }
     // A previously marked position (or a marked start+end pair) auto-fills the
     // next range-style action, so the user never has to repeat numbers they
@@ -2378,7 +2619,9 @@
       case 'merge': {
         const af = getAttached(action.fileId, 'audio');
         if(!af) throw new Error("File "+action.fileId+" (audio) not found");
-        applyAndRefresh(concatBuffers(buffer, af.buffer), "Merged in File "+action.fileId+" ("+af.name+")", {fn:'merge', fileId:action.fileId});
+        const mergeVol = action.volume==null ? 1 : action.volume;
+        const mergeAmt = Math.round(mergeVol*100);
+        applyAndRefresh(concatBuffers(buffer, af.buffer, mergeVol), "Merged in File "+action.fileId+" ("+af.name+"), volume: "+noteAdjustable('mergeVolume', mergeAmt), {fn:'merge', fileId:action.fileId, volume:mergeVol});
         resetEffectStack();
         return "Merged";
       }
@@ -2585,8 +2828,229 @@
   // spoken), so it must NEVER be allowed to block or break the actual edit:
   // no key, no network, a slow reply, or any parsing hiccup all just fall
   // back to the plain technicalMsg instantly.
+  // ========================================================================
+  // TRANSCRIPT — upload the main file to Gemini's Files API, ask it to
+  // transcribe every spoken line with timestamps (and, for video, notable
+  // non-speech audio/visual EVENTS like a bat hitting a ball), then keep the
+  // result around so: (a) commands can cut/mix by WORDS instead of exact
+  // seconds, (b) sync-to-moment mixing works on video, and (c) the
+  // transcript can be read aloud via the existing Play/Rewind/Forward
+  // buttons. This never blocks editing — if it fails or is still loading,
+  // every existing feature keeps working exactly as before; only the
+  // word-based commands are unavailable until it's ready.
+  // ========================================================================
+  function invalidateTranscript(){
+    transcriptGeneration++;
+    transcript = null;
+    transcriptState = 'none'; // edits make old timestamps wrong — but we do NOT auto re-generate (costs a Gemini call); user must ask again if they want it refreshed
+    exitTranscriptMode(false);
+  }
+  function scheduleTranscriptRefresh(apiKeyOverride, announce){
+    const apiKey = apiKeyOverride || (apiKeyInput.value||'').trim();
+    if(!apiKey) { setStatus("Transcript ke liye pehle apni Gemini API key set karein", true); return; }
+    const hasMedia = mediaMode==='video' ? !!videoFile : !!mainFileBlob;
+    if(!hasMedia){ setStatus("Please upload audio or video first", true); return; }
+    const myGen = ++transcriptGeneration;
+    transcript = null;
+    transcriptState = 'loading';
+    if(announce) setStatus("Transcript taiyar kiya ja raha hai, thodi der lagegi...", false, {speak:true, lang:'hi'});
+    requestTranscript(apiKey, myGen).catch(()=>{ /* requestTranscript already handles/reports its own errors */ });
+  }
+  async function uploadFileToGemini(blob, mimeType, displayName, apiKey){
+    const startResp = await fetch("https://generativelanguage.googleapis.com/upload/v1beta/files?key="+encodeURIComponent(apiKey), {
+      method:'POST',
+      headers:{
+        'X-Goog-Upload-Protocol':'resumable',
+        'X-Goog-Upload-Command':'start',
+        'X-Goog-Upload-Header-Content-Length': String(blob.size),
+        'X-Goog-Upload-Header-Content-Type': mimeType,
+        'Content-Type':'application/json'
+      },
+      body: JSON.stringify({file:{display_name: displayName}})
+    });
+    if(!startResp.ok) throw new Error("Could not start upload to Gemini (status "+startResp.status+")");
+    const uploadUrl = startResp.headers.get('x-goog-upload-url');
+    if(!uploadUrl) throw new Error("Gemini did not return an upload URL");
+    const putResp = await fetch(uploadUrl, {
+      method:'POST',
+      headers:{
+        'X-Goog-Upload-Offset':'0',
+        'X-Goog-Upload-Command':'upload, finalize'
+      },
+      body: blob
+    });
+    if(!putResp.ok) throw new Error("File upload to Gemini failed (status "+putResp.status+")");
+    const putData = await putResp.json();
+    let fileInfo = putData.file;
+    if(!fileInfo || !fileInfo.uri) throw new Error("Gemini upload did not return a file reference");
+    // Audio/video files need a moment to move from PROCESSING to ACTIVE before
+    // they can be used in generateContent — poll briefly.
+    let tries = 0;
+    while(fileInfo.state==='PROCESSING' && tries<30){
+      await new Promise(r=>setTimeout(r,1000));
+      const chk = await fetch("https://generativelanguage.googleapis.com/v1beta/"+fileInfo.name+"?key="+encodeURIComponent(apiKey));
+      if(chk.ok){ fileInfo = (await chk.json()); }
+      tries++;
+    }
+    if(fileInfo.state==='FAILED') throw new Error("Gemini could not process this file for transcription");
+    return fileInfo; // {uri, mimeType, name, state}
+  }
+  async function requestTranscript(apiKey, myGen){
+    try{
+      const isVideo = mediaMode==='video';
+      const blob = isVideo ? videoFile : mainFileBlob;
+      if(!blob){ transcriptState='none'; return; }
+      const mimeType = blob.type || (isVideo?'video/mp4':'audio/mpeg');
+      const fileInfo = await uploadFileToGemini(blob, mimeType, (mainFileMeta&&mainFileMeta.name)||'media', apiKey);
+      if(myGen !== transcriptGeneration) return; // a newer edit/upload has superseded this request
+      const eventsAsk = isVideo
+        ? `Also list notable non-speech audio/visual EVENTS useful for syncing a sound effect precisely — e.g. a bat hitting a ball, a goal, a whistle, applause, a collision, a big visual action. Each event: {"time":<seconds>,"description":"<short plain description>"}. If there are none, return an empty array.`
+        : `This is audio-only, so return "events": [] (empty).`;
+      const prompt = `Transcribe every spoken word/line in this media file, in order, as natural short sentences/phrases (not single words), each with a precise start and end time in seconds. If there is no speech at all, return "segments": []. Also report the single main spoken language as a short code (hi=Hindi, mr=Marathi, en=English, gu=Gujarati, ta=Tamil, te=Telugu, kn=Kannada, bn=Bengali, pa=Punjabi, ur=Urdu) — if mixed, pick whichever is dominant. ${eventsAsk}
+Return ONLY strict JSON, no markdown, in exactly this shape:
+{"language":"hi","segments":[{"start":0.0,"end":3.2,"text":"..."}],"events":[{"time":12.4,"description":"..."}]}`;
+      const resp = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key="+encodeURIComponent(apiKey), {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        // A modest thinking cap — transcription/event-detection benefits a
+        // little from reasoning, but this must never run away with the
+        // default dynamic (up to ~8k token) budget on a routine transcribe.
+        body: JSON.stringify({contents:[{parts:[{fileData:{fileUri:fileInfo.uri, mimeType:fileInfo.mimeType||mimeType}},{text:prompt}]}], generationConfig:{thinkingConfig:{thinkingBudget:1024}}})
+      });
+      if(myGen !== transcriptGeneration) return;
+      if(!resp.ok) throw new Error("Gemini transcription request failed (status "+resp.status+")");
+      const data = await resp.json();
+      let txt = data.candidates && data.candidates[0] && data.candidates[0].content.parts[0].text;
+      if(!txt) throw new Error("Gemini returned an empty transcript response");
+      txt = txt.replace(/```json|```/g,'').trim();
+      const firstBrace = txt.indexOf('{');
+      const lastBrace = txt.lastIndexOf('}');
+      if(firstBrace!==-1 && lastBrace!==-1 && lastBrace>firstBrace) txt = txt.slice(firstBrace, lastBrace+1);
+      const parsed = JSON.parse(sanitizeJsonText(txt));
+      if(myGen !== transcriptGeneration) return; // superseded while we were waiting
+      transcript = {
+        language: parsed.language || 'hi',
+        segments: Array.isArray(parsed.segments) ? parsed.segments.filter(s=>s && typeof s.start==='number' && typeof s.end==='number' && s.text) : [],
+        events: Array.isArray(parsed.events) ? parsed.events.filter(e=>e && typeof e.time==='number' && e.description) : []
+      };
+      transcriptState = 'ready';
+      setStatus("Transcript taiyar hai ("+transcript.segments.length+" lines)", false, {speak:true, lang:transcript.language});
+    }catch(err){
+      if(myGen === transcriptGeneration) transcriptState = 'error';
+      // Silent failure — word-based commands just won't be offered; nothing else breaks.
+    }
+  }
+  function transcriptContextText(){
+    if(transcriptState==='loading') return 'A speech transcript is still being prepared in the background — not ready yet. If the user asks for word/content-based cutting or mixing right now, use "ask" to say the transcript is still preparing and to try again in a few seconds, rather than guessing timestamps.';
+    if(transcriptState==='error') return 'Transcript preparation failed for this file — word/content-based cutting or timeline-events are not available; ask the user for an exact time instead if they describe a cut by words.';
+    if(transcriptState!=='ready' || !transcript) return 'No transcript exists yet — it is only prepared when the user explicitly asks (via "generate-transcript" or "read-transcript"), never automatically, since it costs their Gemini quota. If the user describes a cut/mix by words/content instead of exact seconds, use "ask" to tell them to first request a transcript (e.g. "iska transcript bana do") or to give an exact time.';
+    const segLines = transcript.segments.map((s,i)=>i+': ['+s.start.toFixed(2)+'s - '+s.end.toFixed(2)+'s] "'+s.text+'"').join('\n') || '(no speech detected in this file)';
+    const evLines = transcript.events.length ? transcript.events.map(e=>'at '+e.time.toFixed(2)+'s: '+e.description).join(' | ') : '(no notable non-speech events detected)';
+    return `SPEECH TRANSCRIPT (language: ${transcript.language}), each line numbered with its exact start/end in seconds:\n${segLines}\nNOTABLE NON-SPEECH EVENTS (for syncing a sound effect exactly to a moment, e.g. a cricket bat hitting the ball): ${evLines}\nIf the user describes a cut/keep/silence range or a mix/sync point by WORDS or a described moment (e.g. "is mukhde se lekar us antare tak kaat do", "jab bat se ball takraye tab yeh sound daal do") instead of giving exact seconds, find the matching line(s)/event above yourself and output the actual start/end seconds directly in the normal action (range-delete/range-keep/silence-multi/mix/cue-sheet) — do NOT ask the user to repeat it in seconds if it's findable above. For a sync-to-event mix, use the event's time as start, and end = start + the attached file's own duration (given in the attached-files list). Only use "ask" if the described words/moment genuinely cannot be matched to anything above.`;
+  }
+
+  // ---- Transcript playback mode (reuses Play / Rewind / Forward) --------
+  function nearestSegmentIndex(pos){
+    if(!transcript || !transcript.segments.length) return 0;
+    let best=0, bestDist=Infinity;
+    transcript.segments.forEach((s,i)=>{ const d=Math.abs(s.start-pos); if(d<bestDist){bestDist=d; best=i;} });
+    return best;
+  }
+  function enterTranscriptMode(){
+    if(transcriptState==='none'){
+      // User explicitly asked to hear the transcript — that request itself
+      // is the "go ahead" to prepare one (still never happens on its own otherwise).
+      scheduleTranscriptRefresh(null, true);
+      return;
+    }
+    if(transcriptState==='loading'){
+      setStatus("Transcript अभी तैयार हो रहा है, कुछ सेकंड बाद फिर कोशिश करें", true, {lang:'hi'});
+      return;
+    }
+    if(transcriptState!=='ready' || !transcript || !transcript.segments.length){
+      setStatus("इस फाइल के लिए कोई बोली गई लाइन नहीं मिली", true, {lang:'hi'});
+      return;
+    }
+    const pos = getCurrentPos();
+    transcriptIdx = nearestSegmentIndex(pos);
+    transcriptMode = true;
+    if(isPlaying) stopPlayback();
+    if(mediaMode==='video' && videoIsPlaying) videoPause();
+    setTranscriptNavLabels(true);
+    setStatus("अब transcript सुना रहा हूं", false, {speak:true, lang:'hi'});
+    setTimeout(()=> speakCurrentSegment(), 900);
+  }
+  function exitTranscriptMode(announce){
+    if(!transcriptMode) return;
+    transcriptMode = false;
+    transcriptSpeaking = false;
+    try{ window.speechSynthesis.cancel(); }catch(e){}
+    setTranscriptNavLabels(false);
+    if(announce) setStatus("अब असली ऑडियो/वीडियो सुना रहा हूं", false, {speak:true, lang:'hi'});
+  }
+  // Rewind/Forward are reused for transcript navigation (per spec — no new
+  // buttons), but a screen-reader user must be told what they'll ACTUALLY do
+  // right now: a 10-second seek in normal mode, or a line-step in transcript
+  // mode. Only the aria-label changes; the physical buttons stay the same.
+  function setTranscriptNavLabels(inTranscriptMode){
+    if(inTranscriptMode){
+      $('rewindBtn').setAttribute('aria-label', 'Previous transcript line');
+      $('forwardBtn').setAttribute('aria-label', 'Next transcript line');
+    } else {
+      $('rewindBtn').setAttribute('aria-label', 'Rewind 10 seconds');
+      $('forwardBtn').setAttribute('aria-label', 'Fast forward 10 seconds');
+    }
+  }
+  function speakCurrentSegment(){
+    if(!transcriptMode || !transcript || !transcript.segments.length) return;
+    transcriptIdx = Math.max(0, Math.min(transcriptIdx, transcript.segments.length-1));
+    const seg = transcript.segments[transcriptIdx];
+    transcriptSpeaking = true;
+    setPlayBtnLabel("Pause");
+    try{
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(seg.text);
+      u.lang = bcp47For(transcript.language); // phone's own configured voice for this language
+      u.rate = 1.0;
+      u.onend = ()=>{
+        if(!transcriptMode) return;
+        transcriptSpeaking = false;
+        setPlayBtnLabel("Play");
+        // Auto-advance to the next line, like continuous playback.
+        if(transcriptIdx < transcript.segments.length-1){
+          transcriptIdx++;
+          speakCurrentSegment();
+        }
+      };
+      window.speechSynthesis.speak(u);
+    }catch(e){ transcriptSpeaking=false; }
+  }
+  function transcriptPlayPauseToggle(){
+    if(transcriptSpeaking){
+      try{ window.speechSynthesis.cancel(); }catch(e){}
+      transcriptSpeaking = false;
+      setPlayBtnLabel("Play");
+    } else {
+      speakCurrentSegment();
+    }
+  }
+  function transcriptStep(dir){
+    // Sentence-by-sentence, NOT the usual 10-second jump — per spec, while in transcript mode.
+    if(!transcript || !transcript.segments.length) return;
+    transcriptIdx = Math.max(0, Math.min(transcriptIdx + dir, transcript.segments.length-1));
+    speakCurrentSegment();
+  }
+
   async function warmExplain(rawCmd, technicalMsg, isError, apiKey){
     if(!apiKey || !technicalMsg) return technicalMsg;
+    // The action itself already finished by the time this runs — this call
+    // only rewrites the result into one warm sentence. But it's a second,
+    // separate network round-trip, and until now nothing was shown on screen
+    // while it was in flight — a silent gap of up to a few seconds that looks
+    // exactly like "it's still stuck thinking" even though the edit is done.
+    // A quick visual-only pulse (no speech, so it never talks over itself)
+    // fixes that without slowing anything down.
+    const pulseId = setTimeout(()=>{ setStatus(technicalMsg+" — bas bata raha hoon...", false, {speak:false}); }, 1200);
     try{
       const prompt = `You are a warm, friendly voice inside an audio/video editor app, talking to a user who just gave this instruction: "${rawCmd}"
 The app just did the following (technical, terse) — or hit this error: "${technicalMsg}"
@@ -2599,7 +3063,14 @@ Rewrite it as ONE short, warm, natural spoken sentence, in the SAME language/sty
         resp = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key="+encodeURIComponent(apiKey), {
           method:"POST",
           headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({contents:[{parts:[{text:prompt}]}]}),
+          // THIS is the call the user hits after every single slider/effect
+          // command — it's a pure one-sentence rewrite, not a reasoning task,
+          // so thinking must be fully OFF. Leaving Gemini 2.5 Flash's default
+          // dynamic thinking (up to ~8k hidden tokens) on here was silently
+          // burning most of the API quota on the simplest, most frequent call
+          // in the whole app — this is very likely the exact "thinking takes
+          // forever and eats my quota on a slider move" issue.
+          body: JSON.stringify({contents:[{parts:[{text:prompt}]}], generationConfig:{thinkingConfig:{thinkingBudget:0}}}),
           signal: controller.signal
         });
       } finally {
@@ -2612,6 +3083,8 @@ Rewrite it as ONE short, warm, natural spoken sentence, in the SAME language/sty
       return clean || technicalMsg;
     }catch(e){
       return technicalMsg; // timeout / offline / bad response — never break the flow over this
+    } finally {
+      clearTimeout(pulseId);
     }
   }
 
@@ -2630,14 +3103,15 @@ Rewrite it as ONE short, warm, natural spoken sentence, in the SAME language/sty
       done++;
       const desc = describeAction(action) || 'Command';
       updateProgressUI(done, Math.max(queueTotalForProgress, done+queue.length), desc+"...");
-      if(action.type!=='query-level' && action.type!=='ask') setStatus(desc+"...", false, {speak:true});
+      if(action.type!=='query-level' && action.type!=='ask' && action.type!=='info-answer') setStatus(desc+"...", false, {speak:true});
       try{
         const result = await executeAction(action);
         logCommand('[step] '+desc, result || 'Done');
+        if(EDIT_COUNTING_TYPES.has(action.type)) editsSinceLastSuggestion++;
         // Warmly explain the actual result in the user's own language/style —
         // for every action type now (not just a limited few), except
-        // 'query-level'/'ask' which already speak their own message above.
-        if(result && action.type!=='query-level' && action.type!=='ask' && action.type!=='video'){
+        // 'query-level'/'ask'/'info-answer' which already speak their own message above.
+        if(result && action.type!=='query-level' && action.type!=='ask' && action.type!=='info-answer' && action.type!=='video'){
           const warm = await warmExplain(lastRawCommand, result, false, apiKeyInput.value.trim());
           setStatus(warm, false, {speak:true});
         }
@@ -2695,16 +3169,32 @@ Rewrite it as ONE short, warm, natural spoken sentence, in the SAME language/sty
     confirmRow.classList.add('show');
   }
 
+  // Commands the LOCAL parser can answer with total confidence, with zero need
+  // for Gemini's judgement or context — these must always be instant, even when
+  // a Gemini key is configured, so basic transport controls never wait on a
+  // network round-trip. Kept deliberately small: anything that needs context
+  // (info-answer), a diagnosis (complaint-style requests), or could plausibly
+  // be part of a longer sentence Gemini would parse differently is excluded.
+  const LOCAL_FAST_TYPES = new Set(['play','play-original','undo','redo','mark-start','mark-end']);
+
   async function handleCommand(raw){
     const hasMedia = mediaMode==='video' ? !!videoFile : !!buffer;
     if(!hasMedia){ setStatus("Please upload audio or video first", true); return true; }
     lastRawCommand = raw; // used later to keep the warm spoken explanation in the same language/style
     const apiKey = apiKeyInput.value.trim();
+    // Fast local path — checked BEFORE Gemini, whether or not a key is set, so
+    // "play"/"pause"/"undo"/"redo"/mark-point commands never wait on a network call.
+    const quickActions = parseMultiCommand(raw);
+    if(quickActions.length===1 && LOCAL_FAST_TYPES.has(quickActions[0].type)){
+      closeSheet();
+      enqueueActions(quickActions, false);
+      return true;
+    }
     if(apiKey){
       handleWithGemini(raw, apiKey);
       return false;
     }
-    const actions = parseMultiCommand(raw);
+    const actions = quickActions;
     if(actions.length===0){
       const guess = guessIntent(raw);
       if(guess){ showRetryConfirm(guess); return true; }
@@ -2750,11 +3240,35 @@ Rewrite it as ONE short, warm, natural spoken sentence, in the SAME language/sty
     setStatus("Thinking with Gemini...", false, {speak:false});
     cmdInput.value = '';
     sendBtn.classList.remove('show');
+    // "Still thinking" heartbeat — a long Gemini reply should never look
+    // frozen. Silent text updates only (TalkBack's own live-region already
+    // announces status-line changes), so this doesn't talk over anything.
+    // SAFETY NET: even with the 20s fetch timeout below, this interval also
+    // force-clears itself after a hard cap of ticks. Previously, if the fetch
+    // ever hung with no timeout at all, this heartbeat had NO way to stop —
+    // it kept overwriting the status line with "still thinking..." every 4s
+    // forever, even long after the user had already heard the real result
+    // and moved on. This self-cap means that even if some future code path
+    // fails to clear it via the normal route, it can never run forever.
+    let heartbeatCount = 0;
+    const heartbeatMsgs = ["अभी भी सोच रहा हूं...", "बस थोड़ी देर और...", "अभी भी काम चल रहा है..."];
+    const MAX_HEARTBEAT_TICKS = 10; // 10 x 4s = 40s hard ceiling, comfortably above the 20s fetch timeout
+    const heartbeatId = setInterval(()=>{
+      if(heartbeatCount>=MAX_HEARTBEAT_TICKS){ clearInterval(heartbeatId); return; }
+      setStatus(heartbeatMsgs[heartbeatCount % heartbeatMsgs.length], false, {speak:false});
+      heartbeatCount++;
+    }, 4000);
     try{
       const pos = getCurrentPos();
       const dur = getDuration();
-      const attachList = attachedFiles.map(a=>a.id+": "+a.kind+" ("+a.name+")").join(', ') || 'none';
+      const attachList = attachedFiles.map(a=>a.id+": "+a.kind+" ("+a.name+")"+(a.kind==='audio'&&a.buffer?", duration "+a.buffer.duration.toFixed(2)+"s":"")).join(', ') || 'none';
       const audioAttachCount = attachedFiles.filter(a=>a.kind==='audio').length;
+      // Full technical facts about the loaded file, always included so the
+      // AI never has to say "I don't know" about basic project info — it
+      // reads these straight from the actual file/buffer, not a guess.
+      const fileInfoNote = mainFileMeta
+        ? `Loaded file: "${mainFileMeta.name}", format ${mainFileMeta.mimeType}, size ${fmtBytes(mainFileMeta.sizeBytes)} (${mainFileMeta.sizeBytes} bytes), duration ${dur.toFixed(2)}s (${fmtTime(dur)})` + (mediaMode==='audio' && buffer ? `, sample rate ${buffer.sampleRate}Hz, ${buffer.numberOfChannels} channel(s)` : '') + '.'
+        : 'No file metadata available yet.';
       const markNote = (markStart!=null && markEnd!=null)
         ? `A range is currently marked: start at ${markStart.toFixed(2)}s and end at ${markEnd.toFixed(2)}s (the user marked both earlier). If this command implies using that exact range (e.g. "trim this", "silence this part"), use ${markStart.toFixed(2)} as the start and ${markEnd.toFixed(2)} as the end for whichever action fits (range-delete, range-keep, mix, silence-multi) — do not ask the user to repeat the numbers.`
         : markStart!=null ? `A start position is currently marked at ${markStart.toFixed(2)}s (the user said "mark this" earlier). If this command implies using that marked point as a range start (e.g. "trim from here", "yahan tak", "cut up to here"), use ${markStart.toFixed(2)} as the start and the current playhead as the end for whichever action fits (range-delete, range-keep, mix, silence-multi) — do not ask the user to repeat the number.`
@@ -2765,15 +3279,20 @@ Rewrite it as ONE short, warm, natural spoken sentence, in the SAME language/sty
         : 'none set yet';
       const lastAdjNote = `Current level of every adjustable slider touched this session: ${levelsList}. The most recently touched one was ${lastAdjustable ? `"${lastAdjustable.kind}" at ${lastAdjustable.amountPercent}%` : 'none yet'}. If the user asks to adjust a specific one by name (e.g. "bass thoda kam karo") use its own current value from the list above, not the most-recent one. If the user asks for "a bit more/less" without naming which effect or giving a number, use "adjustLast" with direction more/less and omit amount (it will nudge the most-recently-touched slider by a default step); if the user gives an explicit relative amount (e.g. "5% kam karo"), use "adjustLast" with that "step" value instead of guessing a fresh absolute amount; only pass "amount" when the user gives an absolute target (e.g. "isko 40% pe set karo").`;
       const notesNote = userNotes.length ? `The user has asked you to remember these things earlier in this session (most recent last): ${userNotes.map(n=>'"'+n.text+'"').join(' | ')}. Use these as context/names when the current command refers back to them.` : 'The user has not asked you to remember anything yet.';
-      const recentLog = commandLog.map(i=>'"'+i.text+'" -> '+i.result).join(' | ') || 'none yet';
+      const fullHistoryLog = commandLog.map(i=>'"'+i.text+'" -> '+i.result).join(' | ') || 'none yet — nothing has been done to this file this session.';
+      const transcriptNote = transcriptContextText();
+      const transcriptModeNote = transcriptMode ? `The user is CURRENTLY in transcript-listening mode (line ${transcriptIdx+1} of ${transcript?transcript.segments.length:0} is playing/paused via TTS) — a "play"/"play-original"/"play-attachment" command will first exit this mode back to normal audio. Use "stop-transcript" if the user explicitly asks to stop/exit reading the transcript. Use "transcript-next"/"transcript-prev" if they ask for the next/previous line while in this mode.` : `The user is not currently in transcript-listening mode. Use "read-transcript" if they ask to have the transcript/lyrics/lines read aloud (e.g. "transcript sunao", "padh kar sunao", "likha hua padho").`;
       const modeNote = mediaMode==='video'
-        ? `Editing mode is VIDEO. Supported action types in this mode: range-delete, range-keep, silence-multi, mix (attach audio into video), merge (attach video, sequential), volume, mute, effect with fx limited to speedUp|speedDown|fadeIn|fadeOut, undo, redo, play, play-attachment, play-original, mark-start, mark-end, note, ask. Effects like reverb/echo/bass/treble/pitch/normalize/compressor/reverse and sfx are NOT supported on video — do not emit them for video mode.`
+        ? `Editing mode is VIDEO. Supported action types in this mode: range-delete, range-keep, silence-multi, mix (attach audio into video), merge (attach video, sequential), volume, mute, effect with fx limited to speedUp|speedDown|fadeIn|fadeOut, undo, redo, play, play-attachment, play-original, mark-start, mark-end, note, ask, info-answer, read-transcript, stop-transcript, transcript-next, transcript-prev. Effects like reverb/echo/bass/treble/pitch/normalize/compressor/reverse and sfx are NOT supported on video — do not emit them for video mode.`
         : `Editing mode is AUDIO. All action types below are available.`;
       const sys = `You are a command parser for a prompt-driven audio/video editor app. The user speaks Hindi/English/Marathi/mixed, often casually or with typos. Current playhead is ${pos.toFixed(2)}s. Total duration ${dur.toFixed(2)}s. Attached extra files (referenced by user as "pehli file"/"File 2"/etc): ${attachList}. There are ${audioAttachCount} audio file(s) currently attached.
+${fileInfoNote}
 ${markNote}
 ${lastAdjNote}
 ${notesNote}
-Recent commands this session (most recent last): ${recentLog}
+FULL edit history for this session, every step so far, in order (most recent last) — this is everything that has been done to this file, use it to answer any question about what was done, when, or in what order: ${fullHistoryLog}
+${transcriptNote}
+${transcriptModeNote}
 ${modeNote}
 The user may give MULTIPLE instructions in one message (e.g. "trim 30 sec then reverse then volume 0") — return them as a JSON ARRAY of action objects, in order.
 Each action must match one of these shapes exactly:
@@ -2784,7 +3303,7 @@ Each action must match one of these shapes exactly:
 {"type":"sfx","kind":"beep|ding|click|whoosh|drum|clap|alert|chime"}
 {"type":"mix","fileId":<number>,"start":<sec>,"end":<sec>,"volume":<0-1>}
 {"type":"cue-sheet","items":[{"fileId":<number>,"start":<sec>,"end":<sec>,"volume":<0-1>}, ...]}
-{"type":"merge","fileId":<number>,"position":<sec>,"volume":1}
+{"type":"merge","fileId":<number>,"position":<sec>,"volume":<0-1, default 1 if user doesn't say>}
 {"type":"volume","value":<0-1>}
 {"type":"mute"}
 {"type":"mark-start"}
@@ -2802,6 +3321,12 @@ Each action must match one of these shapes exactly:
 {"type":"play-attachment","fileId":<number>}
 {"type":"play-original"}
 {"type":"ask","question":"<short question to ask the user, in the same language they used>"}
+{"type":"info-answer","answer":"<direct, specific answer to the user's question, in the same language they used, written using ONLY the facts already given above in this prompt>"}
+{"type":"read-transcript"}
+{"type":"stop-transcript"}
+{"type":"transcript-next"}
+{"type":"transcript-prev"}
+{"type":"generate-transcript"}
 
 IMPORTANT rules:
 - "mark-start" is for when the user just wants to bookmark a position or remember something tied to the current moment (e.g. "mark this", "yeh dhyan mein rakho", "note this point") WITHOUT any other instruction in the same message. Do not attach it to other actions in the array — return it alone.
@@ -2811,6 +3336,7 @@ IMPORTANT rules:
 - If the user describes SEVERAL background-music placements in one message (a "cue sheet" — e.g. "0 se 2 min jungle sound, 2 min se 2:20 tak violin, uske baad rain sound"), return ONE single "cue-sheet" action containing all of them as items, NOT multiple separate "mix" actions. This lets the app build the whole background layer first and merge it onto the story audio in one clean step.
 - If the user refers to "the audio"/"woh audio"/"ek file" for a mix/cue-sheet item without naming or otherwise identifying which attached audio file they mean, and more than one audio file is attached, do NOT guess which fileId. Instead return a single "ask" action whose question lists the attached audio files by number and name and asks the user to pick one. Do not mix this "ask" with other actions in the same array.
 - Only use fileId values that actually appear in the attached files list above.
+- "merge" attaches the entire file to the end, and its "volume" is entirely up to the user — default to 1 (100%, unchanged) unless they say how loud/soft the merged-in file should be (e.g. "thodi halki awaaz mein jodo" -> a lower value, "zor se" -> higher). Never lower it on your own assumption.
 - "play-attachment" should autoplay the given file immediately (no confirmation needed) — use it whenever the user asks to hear a specific attached file by number/name (e.g. "2nd audio chalao", "play the third video").
 - "play-original" plays the untouched original (before any edits) using the same Play button — use it whenever the user asks to hear the original/before version to compare (e.g. "play the original", "pehle wala sunao"). No confirmation needed.
 - "reset-effects" wipes EVERY effect/edit and restores the untouched original media — use it for phrases like "sab effects hatao", "normal kar do", "original jaisa kar do", "remove everything". Do not use "undo" (which only steps back one edit at a time) for this — use "reset-effects" directly. This action must be the only one returned; never combine it with other actions.
@@ -2819,18 +3345,42 @@ IMPORTANT rules:
 - "query-level" is for when the user is only ASKING what a slider's current value is, without asking for any change — e.g. "bass boost kitna % hai", "reverb abhi kitna hai", "pichla kitna tha" (asking about whatever was last adjusted). It reports the value, it does not change anything. Never combine it with an editing action — return it alone.
 - "adjustLast" re-runs whichever slider (kind) at a new level relative to where it currently sits. Prefer "step" (a relative percentage-point move, e.g. "5% kam karo" -> step:5) over "amount" (an absolute target) whenever the user's phrasing is relative ("kam karo"/"badhao"/"decrease"/"increase") rather than absolute ("X% pe set karo"/"set it to X%"). Use "kind" to name which slider when the user names one explicitly (e.g. "bass thoda kam karo" -> kind:"bassBoost", "volume kam karo" -> kind:"volume"); leave it null to fall back to the most-recently-touched slider.
 - If the user says "kam karo"/"badhao"/"increase"/"decrease" (or names a slider like "volume kam karo") WITHOUT giving any number or percent at all, do NOT invent a default step — instead return a single "ask" action that states the slider's current level (from the levels list above) and asks how much they want to change it by. Only use "adjustLast" without a step/amount if the user explicitly asks for "thoda sa" (a small nudge) or similarly clearly asks for a default-sized bump rather than an exact figure.
+- "info-answer" is for when the user asks a QUESTION about the project/file itself — its duration, format, size, sample rate, how many edits have been done, what was done and in what order, which files are attached, the current value of any control, or what was actually SAID/sung in the audio (use the speech transcript above for that) — rather than asking for a change. Answer directly and specifically using the file info, edit history, attached-files list, control values, and transcript given above in this prompt — everything needed is already provided above. NEVER respond with "I don't know" or "I don't have that information" — the facts are in this prompt; find and use them. Only if something is genuinely not covered by anything above should you give your best reasonable answer from what IS known, briefly noting what you're inferring, rather than refusing. This must be the only action returned when used — never combine it with an editing action.
+- CRITICAL disambiguation: a QUESTION (asking what/kya/kaunsa/kitna/kab/kaise happened, was done, was cut, was said) is ALWAYS "info-answer", even if it also contains words like "sunao"/"play"/"batao" — e.g. "aapne isme se kya kaata, zara batao" or "yeh gaana kaise edit hua sunao" are questions about the edit history, NOT a request to play audio. Only use "play"/"play-original"/"play-attachment" when the user is asking to actually HEAR the media itself with no question being asked (e.g. "play karo", "sunao", "pehle wala bajao" alone, without asking what/why/kaisa about it). When in doubt between a question and a play request, prefer "info-answer" — answering a question wrongly by just playing audio back leaves the user's actual question completely unanswered.
+- "read-transcript" is for when the user wants the transcript/lyrics/lines read aloud (e.g. "transcript sunao", "likha hua padh kar sunao", "lines padho"). Return it alone — if no transcript exists yet, the app will prepare one automatically because asking to hear it IS an explicit request. "stop-transcript" is for when the user explicitly wants to stop/exit that reading mode without starting normal playback. "transcript-next"/"transcript-prev" move one line forward/back while already in that mode (e.g. "agli line", "pichli line", "next line", "wapas jao ek line"). If the user is in transcript-listening mode and just says "play"/"stop"/asks to hear the real audio again, treat that as a normal "play"/"play-original" action — the app itself exits transcript mode first.
+- "generate-transcript" is for when the user EXPLICITLY asks to transcribe/prepare a transcript of the current audio/video without asking to hear it read aloud (e.g. "iska transcript bana do", "is audio ko transcribe karo", "lines identify kar do"). Return it alone. IMPORTANT: never emit this (or assume a transcript exists) for any other reason — transcription costs the user's Gemini quota, so it must ONLY happen when they've clearly asked for it (directly via this action, or indirectly by asking to hear the transcript via "read-transcript"). If the user asks for word/content-based cutting or mixing (see transcript note above) and no transcript exists yet, do NOT trigger generation yourself — use "ask" to tell them to first say something like "iska transcript bana do", or to just give the exact time instead.
+
+- MULTI-PARAMETER EFFECT GROUPS (reverb, echo, compressor, phaser, limiter, EQ) each have several independent sub-controls, not one single knob. If the user names one of these groups generically WITHOUT specifying which sub-control and how much (e.g. "reverb lagao", "echo daal do", "compressor lagao", "isme thoda character daalo"), do NOT guess and apply values yourself. Instead return a single "ask" action whose question: (1) lists each sub-control in that group by number with a short plain-language description of what it does to the sound, (2) states its current/default value, and (3) invites the user to say which number(s) and what percentage, or just say "haan"/"yes" to accept the defaults shown. Example shape for reverb: "Reverb mein 4 hisse hain — 1) Mix (kitni goonj mile) abhi 0% 2) Room Size (chhota kamra ya bada hall) abhi 75% 3) Width (aawaz kitni faili sunayi de) abhi 50% 4) Damp (goonj kitni jaldi dab jaye) abhi 75%. Konsa aur kitna % chahiye, ya 'haan' boliye default lagane ke liye." If the user then replies with a bare "haan"/"yes"/"ok", apply the exact defaults you just stated (as "set-control" + "apply-advanced" actions) — do not re-ask. If they answer by position ("teesra thoda kam karo, chautha badha do"), match "teesra"/"third" etc. to the exact numbered list you gave in your own last question (this app resends the recent conversation so you can see what you asked) — never guess a different mapping. This rule does NOT apply to single-value sliders (volume, bass, treble, pitch, speed) — those apply directly using their current value as already described above, no listing needed.
+- COMPLAINT-STYLE / DIAGNOSTIC requests describe a problem in the sound rather than naming a specific slider+amount — e.g. "reverb mein bahut zyada aawaz ghoom rahi hai, thik kar do", "yeh muddy/ajeeb sunayi de raha hai", "bahut noise hai isme", "awaaz saaf nahi lag rahi". For these: diagnose which 1-3 real controls are the likely cause and return them as small, SUBTLE corrective "set-control"/"apply-advanced" actions (e.g. reduce reverbMix by a modest amount, not to zero; a light compressor touch; noiseReduction a few dB) — never a drastic change, and never touch controls unrelated to the specific complaint. Since this returns multiple actions, the app will show the user exactly what each change is before applying it and wait for their confirmation — so it is fine (expected) to propose the fix this way rather than asking first. Keep the changes conservative enough that the user's own prior editing choices are still clearly preserved, not overridden.
 
 Current real control values: ${getAdvancedControlContext()}\n${ADVANCED_AI_SCHEMA}\nReturn ONLY a strict JSON array, no markdown, no prose. If nothing is understood, return [].
 User command: "${raw}"`;
       let resp;
+      // No timeout here before now meant a slow/stuck Gemini call would leave
+      // the user staring at "abhi bhi soch raha hoon..." forever, with no
+      // fallback ever triggering — this is very likely the exact "it just
+      // keeps saying thinking" symptom. Same 20s ceiling pattern as warmExplain,
+      // just longer since this call actually has real work (JSON action plan)
+      // to do, not one sentence.
+      const controller = new AbortController();
+      const timeoutId = setTimeout(()=>controller.abort(), 20000);
       try{
         resp = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key="+encodeURIComponent(apiKey), {
           method:"POST",
           headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({contents:[{parts:[{text:sys}]}]})
+          // This one DOES sometimes need a little real judgement (matching
+          // "teesra/chautha" to a numbered list, diagnosing a complaint into
+          // small corrective changes), so thinking isn't fully off — but it's
+          // capped well below the model's default dynamic budget (which can
+          // run up to ~8k hidden tokens even for a plain "reverb 15%" command).
+          body: JSON.stringify({contents:[{parts:[{text:sys}]}], generationConfig:{thinkingConfig:{thinkingBudget:512}}}),
+          signal: controller.signal
         });
       }catch(netErr){
+        if(netErr.name==='AbortError') throw new Error("NETWORK: Gemini took too long to respond (over 20s)");
         throw new Error("NETWORK: Could not reach Gemini — check your internet connection");
+      } finally {
+        clearTimeout(timeoutId);
       }
       if(resp.status===401 || resp.status===403){
         throw new Error("KEY: Your API key looks invalid or was rejected — check it in the API Key button");
@@ -2853,7 +3403,7 @@ User command: "${raw}"`;
       if(firstBracket!==-1 && lastBracket!==-1 && lastBracket>firstBracket){
         txt = txt.slice(firstBracket, lastBracket+1);
       }
-      const actions = JSON.parse(txt);
+      const actions = JSON.parse(sanitizeJsonText(txt));
       if(!Array.isArray(actions) || actions.length===0){
         const guess = guessIntent(raw);
         if(guess){ showRetryConfirm(guess); return; }
@@ -2888,6 +3438,8 @@ User command: "${raw}"`;
         const actions = parseMultiCommand(raw);
         if(actions.length) enqueueActions(actions, false);
       }
+    } finally {
+      clearInterval(heartbeatId);
     }
   }
 
@@ -3036,7 +3588,9 @@ User command: "${raw}"`;
     group('Volume, speed & pitch','<div class="advGrid">'+ctl('volume','Volume',0,2,.01,1)+ctl('speed','Tempo / Speed',.25,4,.01,1)+ctl('pitch','Pitch (cents)',-1200,1200,1,0)+'</div>');
     group('Other operations','<div class="advPreset"><button type="button" id="advNormalize">Normalize</button><button type="button" id="advReverse">Reverse Audio</button></div>');
     const anchor=document.getElementById('bottomBar');anchor.parentNode.insertBefore(panel,anchor);
-    const fxBtn=document.createElement('button');fxBtn.id='effectsBtn';fxBtn.className='advBtn';fxBtn.textContent='Effects';fxBtn.setAttribute('aria-label','Open audio effects controls');document.getElementById('bottomBar').insertBefore(fxBtn,document.getElementById('editBoxBtn'));fxBtn.addEventListener('click',()=>panel.classList.toggle('open'));
+    // NOTE: visible "Effects" button removed from the bottom bar per updated spec.
+    // The panel element + all controls/logic below are kept intact so AI commands
+    // can still read/set control values and call applyAdvancedControls().
     panel.querySelectorAll('[data-adv-key]').forEach(el=>el.addEventListener('input',()=>{advSet(el.dataset.advKey,el.value);const o=panel.querySelector('[data-adv-value="'+CSS.escape(el.dataset.advKey)+'"]');if(o)o.textContent=advDisplayValue(el.dataset.advKey,Number(el.value));}));
     $('advApply').addEventListener('click',()=>applyAdvancedControls());
     $('advReset').addEventListener('click',()=>{advancedControls={...ADVANCED_CONTROL_DEFAULTS,eq:Object.fromEntries(ADVANCED_EQ_BANDS.map(f=>[String(f),0]))};syncAdvancedUI();});
@@ -3105,142 +3659,5 @@ User command: "${raw}"`;
   // click outside sheet content but inside sheet shouldn't close; overlay handles outside click.
 })();
 </script>
-<!-- AI Audio Assistant: additive feature layer; existing editor code is preserved -->
-<section id="aiAudioAssistant" aria-label="AI Audio Assistant" style="margin:18px 0;padding:16px;border:1px solid #d8d8d8;border-radius:14px;background:#fafafa;font-family:system-ui,sans-serif">
-  <h2 style="margin:0 0 5px">🎧 AI Audio Assistant</h2>
-  <div style="font-size:13px;color:#666;margin-bottom:12px">ऑडियो, टाइमलाइन, मिक्सिंग और एडिटिंग के बारे में पूछें। वास्तविक बदलाव करने से पहले पुष्टि ली जाएगी।</div>
-  <div id="aiAudioChatLog" style="min-height:90px;max-height:300px;overflow:auto;padding:10px;border:1px solid #ddd;border-radius:10px;background:#fff">
-    <div style="color:#777">उदाहरण: “यह ऑडियो कितने MB का है और कितने मिनट का है?”</div>
-  </div>
-  <div style="display:flex;gap:8px;margin-top:10px">
-    <input id="aiAudioChatInput" type="text" placeholder="ऑडियो के बारे में कुछ भी पूछें…" style="flex:1;padding:11px;border:1px solid #bbb;border-radius:10px">
-    <button id="aiAudioChatAsk" type="button" style="padding:11px 16px;border:0;border-radius:10px;cursor:pointer">पूछें</button>
-  </div>
-  <div id="aiAudioChatStatus" style="margin-top:7px;font-size:12px;color:#666"></div>
-</section>
-<!-- AI Assistant V2: verified control execution layer -->
-<script>
-(function () {
-  const input = document.getElementById('aiAudioChatInput');
-  const ask = document.getElementById('aiAudioChatAsk');
-  const log = document.getElementById('aiAudioChatLog');
-  const status = document.getElementById('aiAudioChatStatus');
-  if (!input || !ask || !log) return;
-
-  // Keep the assistant's state synchronized with the actual DOM control.
-  function ranges() {
-    return Array.from(document.querySelectorAll('input[type="range"]'));
-  }
-
-  function label(r, i) {
-    return (r.getAttribute('aria-label') || r.name || r.id || '').toLowerCase() || ('slider ' + (i+1));
-  }
-
-  function findControl(kind) {
-    const rs = ranges();
-    const keys = {
-      reverb: ['reverb','reverberation','गूंज','गूँज'],
-      bass: ['bass','bass boost','बास','बेस'],
-      volume: ['volume','gain','वॉल्यूम','आवाज़']
-    };
-    const wanted = keys[kind] || [kind];
-    return rs.find((r,i) => wanted.some(k => label(r,i).includes(k)));
-  }
-
-  function setVerified(control, percent) {
-    if (!control) return {ok:false, reason:'उपयुक्त control नहीं मिला'};
-    const min = Number.isFinite(parseFloat(control.min)) ? parseFloat(control.min) : 0;
-    const max = Number.isFinite(parseFloat(control.max)) ? parseFloat(control.max) : 100;
-    const p = Math.max(0, Math.min(100, percent));
-    const value = min + (max-min) * (p/100);
-    control.value = String(value);
-    control.dispatchEvent(new Event('input', {bubbles:true}));
-    control.dispatchEvent(new Event('change', {bubbles:true}));
-    const actual = parseFloat(control.value);
-    return {ok:Math.abs(actual-value) < Math.max(0.0001, Math.abs(max-min)*0.001),
-            actualPercent: ((actual-min)/(max-min))*100};
-  }
-
-  function esc(s) {
-    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
-  }
-  function say(who, msg) {
-    const d = document.createElement('div');
-    d.style.cssText = 'margin:8px 0;padding:9px 11px;border-radius:10px;background:#f3f3f3';
-    d.innerHTML = '<strong>' + esc(who) + ':</strong> ' + esc(msg);
-    log.appendChild(d); log.scrollTop = log.scrollHeight;
-  }
-
-  // Handles natural-language percentage commands for the controls that are
-  // explicitly discoverable in the existing editor UI.
-  function actionFromQuestion(q) {
-    const s = q.toLowerCase();
-    const m = s.match(/(\d+(?:[.,]\d+)?)\s*%/);
-    if (!m) return null;
-    const pct = parseFloat(m[1].replace(',', '.'));
-    if (!Number.isFinite(pct) || pct < 0 || pct > 100) return null;
-
-    let kind = null;
-    if (/reverb|रेवर्ब|गूंज|गूँज/.test(s)) kind = 'reverb';
-    else if (/bass|बास|बेस/.test(s)) kind = 'bass';
-    else if (/volume|वॉल्यूम|आवाज़/.test(s)) kind = 'volume';
-    if (!kind) return null;
-
-    return {kind, pct};
-  }
-
-  // If the user says "yes" after a pending action, execute it.
-  let pending = null;
-
-  function handle(q) {
-    const yes = /^(yes|y|हाँ|हां|हा|ठीक|ठीक है|करो|डन|done)$/i.test(q.trim());
-    if (yes && pending) {
-      const result = setVerified(pending.control, pending.pct);
-      const action = pending;
-      pending = null;
-      if (result.ok) {
-        say('AI Audio Assistant',
-          action.kind.toUpperCase() + ' को ' + Math.round(result.actualPercent*100)/100 + '% पर लागू कर दिया है और control value verify भी कर दी है।');
-      } else {
-        say('AI Audio Assistant',
-          'मैंने बदलाव लागू करने की कोशिश की, लेकिन control की वास्तविक value verify नहीं हुई। मैंने Done नहीं कहा है।');
-      }
-      return;
-    }
-
-    const action = actionFromQuestion(q);
-    if (action) {
-      const control = findControl(action.kind);
-      if (!control) {
-        say('AI Audio Assistant',
-          'मुझे ' + action.kind + ' का वास्तविक slider/control नहीं मिला, इसलिए मैं झूठा बदलाव लागू होने का दावा नहीं करूँगा।');
-        return;
-      }
-      const min = parseFloat(control.min || 0), max = parseFloat(control.max || 100);
-      const cur = parseFloat(control.value);
-      const curPct = max === min ? 0 : ((cur-min)/(max-min))*100;
-      pending = {kind:action.kind, pct:action.pct, control};
-      say('AI Audio Assistant',
-        action.kind + ' अभी लगभग ' + Math.round(curPct*100)/100 + '% है। इसे ' +
-        action.pct + '% पर करने की पुष्टि करें—“हाँ” बोलें।');
-      return;
-    }
-
-    // Keep the existing conversational behavior for non-action questions.
-    say('AI Audio Assistant',
-      'मैंने इस सवाल को action command के रूप में नहीं बदला। आप उदाहरण के लिए “Reverb 15% कर दो” कह सकते हैं; मैं पहले current value देखकर confirmation लूँगा और फिर वास्तविक control बदलकर verify करूँगा।');
-  }
-
-  // Replace only the V2 panel's click/Enter behavior; existing editor logic remains.
-  ask.onclick = function () {
-    const q = input.value.trim(); if (!q) return;
-    say('आप', q); input.value = '';
-    status.textContent = 'वास्तविक editor control की जाँच कर रहा हूँ…';
-    setTimeout(() => { handle(q); status.textContent = 'Editor state के साथ synchronized.'; }, 0);
-  };
-  input.onkeydown = function(e) { if (e.key === 'Enter') ask.click(); };
-})();
-</script>
-
 </body>
 </html>
